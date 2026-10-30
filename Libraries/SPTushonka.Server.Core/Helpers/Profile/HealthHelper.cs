@@ -3,6 +3,7 @@ using SPTarkov.DI.Annotations;
 using SPTarkov.Server.Core.Exceptions.Helpers;
 using SPTarkov.Server.Core.Models.Eft.Common;
 using SPTarkov.Server.Core.Models.Eft.Common.Tables;
+using SPTarkov.Server.Core.Models.Enums;
 using SPTarkov.Server.Core.Models.Spt.Config;
 using SPTarkov.Server.Core.Utils;
 using BodyPartHealth = SPTarkov.Server.Core.Models.Eft.Common.Tables.BodyPartHealth;
@@ -13,6 +14,12 @@ namespace SPTarkov.Server.Core.Helpers.Profile;
 public class HealthHelper(ISptLogger<HealthHelper> logger, TimeUtil timeUtil, HealthConfig healthConfig)
 {
     protected readonly HashSet<string> EffectsToSkip = ["Dehydration", "Exhaustion"];
+    private const int LightBleedingTimeInSeconds = 600;
+    private const int HeavyBleedingTimeInSeconds = 900;
+    protected const double Deviation = 0.0001;
+    protected const double BaseEnergyRegenPerHour = 60;
+    protected const double BaseHydrationRegenPerHour = 60;
+    protected const double BaseHpRegenPerHour = 456.6;
 
     /// <summary>
     ///     Update player profile vitality values with changes from client request object
@@ -101,6 +108,14 @@ public class HealthHelper(ISptLogger<HealthHelper> logger, TimeUtil timeUtil, He
         bool playerWasCursed = false
     )
     {
+        var debuffEndDelayPercent =
+            profileToAdjust
+                .Bonuses?.Where(bonus => bonus.Type == BonusType.DebuffEndDelay)
+                .Aggregate(0d, (sum, bonus) => sum + bonus.Value!.Value)
+            ?? 0d;
+
+        var debuffEndDelayMultiplier = Math.Max(0d, 1d + (debuffEndDelayPercent / 100d));
+
         foreach (var (partName, partProperties) in bodyPartChanges)
         {
             // Pattern matching null and false because otherwise the compiler throws a fit because `matchingProfilePart`
@@ -142,11 +157,27 @@ public class HealthHelper(ISptLogger<HealthHelper> logger, TimeUtil timeUtil, He
                 }
             }
 
+            // Have effects we need to add, init effect array
+            matchingProfilePart.Effects ??= [];
+
+            // Anything the server has for this part that the client did NOT report is no longer active (expired or treated in raid) - remove it
+            var clientKeys = partProperties.Effects?.Keys ?? Enumerable.Empty<string>();
+            foreach (var serverKey in matchingProfilePart.Effects.Keys.ToList())
+            {
+                if (!clientKeys.Contains(serverKey))
+                {
+                    matchingProfilePart.Effects.Remove(serverKey);
+                }
+            }
+
             // Process each effect for each part
             foreach (var (key, effectDetails) in partProperties.Effects ?? [])
             {
-                // Have effects we need to add, init effect array
-                matchingProfilePart.Effects ??= [];
+                var isSkipped = effectsToSkip is not null && effectsToSkip.Contains(key);
+                var isBleedKey =
+                    key.Equals("LightBleeding", StringComparison.OrdinalIgnoreCase)
+                    || key.Equals("HeavyBleeding", StringComparison.OrdinalIgnoreCase);
+                var bleedOverrideSeconds = GetBleedExitOverrideTime(key, debuffEndDelayMultiplier);
 
                 if (
                     key.Equals("MildMusclePain", StringComparison.OrdinalIgnoreCase)
@@ -157,37 +188,49 @@ public class HealthHelper(ISptLogger<HealthHelper> logger, TimeUtil timeUtil, He
                     continue;
                 }
 
+                // Bleed reduced to zero or below by DebuffEndDelay bonuses - treat as fully resolved
+                if (isBleedKey && bleedOverrideSeconds is null)
+                {
+                    matchingProfilePart.Effects.Remove(key);
+                    continue;
+                }
+
                 // Effect on limb already exists in server profile, handle differently
                 if (matchingProfilePart.Effects.ContainsKey(key))
                 {
                     matchingProfilePart.Effects.TryGetValue(key, out var matchingEffectOnServer);
 
                     // Edge case - effect already exists at destination, but we don't want to overwrite details e.g. Exhaustion
-                    if (effectsToSkip is not null && effectsToSkip.Contains(key))
+                    if (isSkipped)
                     {
                         matchingProfilePart.Effects[key] = null;
                     }
-
-                    // Effect time has decreased while in raid, persist this reduction into profile
-                    if (
+                    else if (bleedOverrideSeconds is not null && matchingEffectOnServer is not null)
+                    {
+                        // Bleeds always get a fresh timer on raid exit (client always sends -1 for these in-raid)
+                        matchingEffectOnServer.Time = bleedOverrideSeconds;
+                    }
+                    else if (
                         effectDetails?.Time is not null
                         && matchingEffectOnServer?.Time is not null
                         && effectDetails.Time < matchingEffectOnServer.Time
                     )
                     {
+                        // Effect time has decreased while in raid, persist this reduction into profile
                         matchingEffectOnServer.Time = effectDetails.Time;
                     }
 
                     continue;
                 }
 
-                if (effectsToSkip is not null && effectsToSkip.Contains(key))
+                if (isSkipped)
                 // Do not pass skipped effect into profile
                 {
                     continue;
                 }
 
-                var effectToAdd = new BodyPartEffectProperties { Time = effectDetails?.Time ?? -1 };
+                var effectToAdd = new BodyPartEffectProperties { Time = bleedOverrideSeconds ?? effectDetails?.Time ?? -1 };
+
                 // Add effect to server profile
                 if (matchingProfilePart.Effects.TryAdd(key, effectToAdd))
                 {
@@ -195,6 +238,149 @@ public class HealthHelper(ISptLogger<HealthHelper> logger, TimeUtil timeUtil, He
                 }
             }
         }
+    }
+
+    /// <summary>
+    ///     Advance energy, hydration, limb hp and effect timers by the time since health was last updated
+    /// </summary>
+    /// <param name="pmcProfile">Profile to adjust values for</param>
+    /// <param name="decreaseBodyPartEffectTimes">Replaces DecreaseBodyPartEffectTimes when given</param>
+    public void UpdateProfileHealthValues(
+        PmcData pmcProfile,
+        Action<PmcData, double, double>? decreaseBodyPartEffectTimes = null
+    )
+    {
+        var healthLastUpdated = pmcProfile.Health?.UpdateTime;
+        var currentTimeStamp = timeUtil.GetTimeStamp();
+        var diffSeconds = currentTimeStamp - healthLastUpdated;
+
+        // Update just occurred
+        if (healthLastUpdated >= currentTimeStamp)
+        {
+            return;
+        }
+
+        // Set new values, whatever is smallest
+        var energyRegenPerHour =
+            BaseEnergyRegenPerHour
+            + pmcProfile
+                .Bonuses!.Where(bonus => bonus.Type == BonusType.EnergyRegeneration)
+                .Aggregate(0d, (sum, bonus) => sum + bonus.Value!.Value);
+
+        var hydrationRegenPerHour =
+            BaseHydrationRegenPerHour
+            + pmcProfile
+                .Bonuses!.Where(bonus => bonus.Type == BonusType.HydrationRegeneration)
+                .Aggregate(0d, (sum, bonus) => sum + bonus.Value!.Value);
+
+        var hpRegenPerHour =
+            BaseHpRegenPerHour
+            + pmcProfile
+                .Bonuses!.Where(bonus => bonus.Type == BonusType.HealthRegeneration)
+                .Aggregate(0d, (sum, bonus) => sum + bonus.Value!.Value);
+
+        // Player has energy deficit
+        if (pmcProfile.Health?.Energy?.Current - pmcProfile.Health?.Energy?.Maximum <= Deviation)
+        {
+            // Set new value, whatever is smallest
+            pmcProfile.Health!.Energy!.Current += Math.Round(energyRegenPerHour * (diffSeconds!.Value / 3600));
+            if (pmcProfile.Health.Energy.Current > pmcProfile.Health.Energy.Maximum)
+            {
+                pmcProfile.Health.Energy.Current = pmcProfile.Health.Energy.Maximum;
+            }
+        }
+
+        // Player has hydration deficit
+        if (pmcProfile.Health?.Hydration?.Current - pmcProfile.Health?.Hydration?.Maximum <= Deviation)
+        {
+            pmcProfile.Health!.Hydration!.Current += Math.Round(hydrationRegenPerHour * (diffSeconds!.Value / 3600));
+            if (pmcProfile.Health.Hydration.Current > pmcProfile.Health.Hydration.Maximum)
+            {
+                pmcProfile.Health.Hydration.Current = pmcProfile.Health.Hydration.Maximum;
+            }
+        }
+
+        // Check all body parts
+        (decreaseBodyPartEffectTimes ?? DecreaseBodyPartEffectTimes)(pmcProfile, hpRegenPerHour, diffSeconds.Value);
+
+        // Update both values as they've both been updated
+        pmcProfile.Health.UpdateTime = currentTimeStamp;
+    }
+
+    /// <summary>
+    ///     Check for and update any timers on effect found on body parts
+    /// </summary>
+    /// <param name="pmcProfile">Player</param>
+    /// <param name="hpRegenPerHour"></param>
+    /// <param name="diffSeconds"></param>
+    public void DecreaseBodyPartEffectTimes(PmcData pmcProfile, double hpRegenPerHour, double diffSeconds)
+    {
+        var bodyParts = pmcProfile.Health!.BodyParts!.Select(bodyPartKvP => bodyPartKvP.Value).ToList();
+
+        // HP regeneration is an overall rate, so divide it across count of body parts
+        var hpRegenPerPart = hpRegenPerHour * (diffSeconds / 3600d) / bodyParts.Count;
+
+        foreach (var bodyPart in pmcProfile.Health!.BodyParts!.Select(bodyPartKvP => bodyPartKvP.Value))
+        {
+            // Check part hp
+            if (bodyPart.Health!.Current < bodyPart.Health.Maximum)
+            {
+                bodyPart.Health.Current += hpRegenPerPart;
+            }
+
+            if (bodyPart.Health.Current > bodyPart.Health.Maximum)
+            {
+                bodyPart.Health.Current = bodyPart.Health.Maximum;
+            }
+
+            if (bodyPart.Effects is null || bodyPart.Effects.Count == 0)
+            {
+                continue;
+            }
+
+            // Look for effects
+            foreach (var (effectId, effect) in bodyPart.Effects)
+            {
+                // Effects below 1 are intentional (e.g. -1). Do not modify or remove them
+                // Skipped effects are stored as null by ModifyProfileHealthProperties
+                if (effect is null || effect.Time < 1)
+                {
+                    continue;
+                }
+
+                // Decrease the effect duration by the elapsed time
+                effect.Time -= diffSeconds;
+
+                // Effect has now expired
+                if (effect.Time < 1)
+                {
+                    bodyPart.Effects.Remove(effectId);
+                }
+            }
+        }
+    }
+
+    private double? GetBleedExitOverrideTime(string effectKey, double debuffEndDelayMultiplier)
+    {
+        int baseSeconds;
+
+        if (effectKey.Equals("LightBleeding", StringComparison.OrdinalIgnoreCase))
+        {
+            baseSeconds = LightBleedingTimeInSeconds;
+        }
+        else if (effectKey.Equals("HeavyBleeding", StringComparison.OrdinalIgnoreCase))
+        {
+            baseSeconds = HeavyBleedingTimeInSeconds;
+        }
+        else
+        {
+            return null;
+        }
+
+        var adjusted = baseSeconds * debuffEndDelayMultiplier;
+
+        // guard in case they have bonuses reducing it beyond 100%
+        return adjusted > 0 ? adjusted : null;
     }
 
     /// <summary>

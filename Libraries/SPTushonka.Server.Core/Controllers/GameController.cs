@@ -14,6 +14,7 @@ using SPTarkov.Server.Core.Models.Spt.Config;
 using SPTarkov.Server.Core.Models.Spt.Location;
 using SPTarkov.Server.Core.Models.Spt.Mod;
 using SPTarkov.Server.Core.Models.Spt.Tables;
+using SPTarkov.Server.Core.Servers;
 using SPTarkov.Server.Core.Services;
 using SPTarkov.Server.Core.Services.Commerce;
 using SPTarkov.Server.Core.Services.InRaid;
@@ -35,6 +36,7 @@ public class GameController(
     TimeUtil timeUtil,
     HttpServerHelper httpServerHelper,
     HideoutHelper hideoutHelper,
+    HealthHelper healthHelper,
     ProfileHelper profileHelper,
     ProfileFixerService profileFixerService,
     ServerLocalisationService serverLocalisationService,
@@ -43,14 +45,14 @@ public class GameController(
     GiftService giftService,
     RaidTimeAdjustmentService raidTimeAdjustmentService,
     ProfileActivityService profileActivityService,
+    SaveServer saveServer,
     BotConfig botConfig,
     CoreConfig coreConfig,
     HideoutConfig hideoutConfig,
-    HttpConfig httpConfig
+    HttpConfig httpConfig,
+    HealthConfig healthConfig
 )
 {
-    protected const double Deviation = 0.0001;
-
     /// <summary>
     ///     Handle client/game/start
     /// </summary>
@@ -164,9 +166,7 @@ public class GameController(
     public GameConfigResponse GetGameConfig(MongoId sessionId)
     {
         var profile = profileHelper.GetPmcProfile(sessionId);
-        var gameTime =
-            profile?.Stats?.Eft?.OverallCounters?.Items?.FirstOrDefault(c => c.Key!.Contains("LifeTime") && c.Key.Contains("Pmc"))?.Value
-            ?? 0D;
+        var gameTime = profileHelper.GetFullProfile(sessionId).ProfileInfo?.TotalInGame ?? 0;
 
         var config = new GameConfigResponse
         {
@@ -246,6 +246,7 @@ public class GameController(
     public GameKeepAliveResponse GetKeepAlive(MongoId sessionId)
     {
         profileActivityService.SetActivityTimestamp(sessionId);
+        profileActivityService.AddKeepAlive(sessionId);
         return new GameKeepAliveResponse { Message = "OK", UtcTime = timeUtil.GetTimeStamp() };
     }
 
@@ -283,65 +284,36 @@ public class GameController(
     }
 
     /// <summary>
-    ///     When player logs in, iterate over all active effects and reduce timer
+    ///     Advance the stored health of recently active profiles, the client counts it down live
+    /// </summary>
+    public void UpdateActiveProfilesHealth()
+    {
+        foreach (var (sessionId, profile) in saveServer.GetProfiles())
+        {
+            if (saveServer.IsProfileInvalidOrUnloadable(sessionId))
+            {
+                continue;
+            }
+
+            var pmcProfile = profile.CharacterData?.PmcData;
+            if (
+                pmcProfile?.Health is not null
+                && profileActivityService.ActiveWithinLastMinutes(sessionId, healthConfig.UpdateProfileHealthWhenActiveWithinMinutes)
+            )
+            {
+                UpdateProfileHealthValues(pmcProfile);
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Iterate over all active effects and reduce timer, runs on login and periodically while active
     /// </summary>
     /// <param name="pmcProfile">Profile to adjust values for</param>
+    //Todo: Remove this at some point probably, it's just kept here to keep mods compatible
     protected void UpdateProfileHealthValues(PmcData pmcProfile)
     {
-        var healthLastUpdated = pmcProfile.Health?.UpdateTime;
-        var currentTimeStamp = timeUtil.GetTimeStamp();
-        var diffSeconds = currentTimeStamp - healthLastUpdated;
-
-        // Update just occurred
-        if (healthLastUpdated >= currentTimeStamp)
-        {
-            return;
-        }
-
-        // Base values
-        double energyRegenPerHour = 60;
-        double hydrationRegenPerHour = 60;
-        var hpRegenPerHour = 456.6;
-
-        // Set new values, whatever is smallest
-        energyRegenPerHour += pmcProfile
-            .Bonuses!.Where(bonus => bonus.Type == BonusType.EnergyRegeneration)
-            .Aggregate(0d, (sum, bonus) => sum + bonus.Value!.Value);
-
-        hydrationRegenPerHour += pmcProfile
-            .Bonuses!.Where(bonus => bonus.Type == BonusType.HydrationRegeneration)
-            .Aggregate(0d, (sum, bonus) => sum + bonus.Value!.Value);
-
-        hpRegenPerHour += pmcProfile
-            .Bonuses!.Where(bonus => bonus.Type == BonusType.HealthRegeneration)
-            .Aggregate(0d, (sum, bonus) => sum + bonus.Value!.Value);
-
-        // Player has energy deficit
-        if (pmcProfile.Health?.Energy?.Current - pmcProfile.Health?.Energy?.Maximum <= Deviation)
-        {
-            // Set new value, whatever is smallest
-            pmcProfile.Health!.Energy!.Current += Math.Round(energyRegenPerHour * (diffSeconds!.Value / 3600));
-            if (pmcProfile.Health.Energy.Current > pmcProfile.Health.Energy.Maximum)
-            {
-                pmcProfile.Health.Energy.Current = pmcProfile.Health.Energy.Maximum;
-            }
-        }
-
-        // Player has hydration deficit
-        if (pmcProfile.Health?.Hydration?.Current - pmcProfile.Health?.Hydration?.Maximum <= Deviation)
-        {
-            pmcProfile.Health!.Hydration!.Current += Math.Round(hydrationRegenPerHour * (diffSeconds!.Value / 3600));
-            if (pmcProfile.Health.Hydration.Current > pmcProfile.Health.Hydration.Maximum)
-            {
-                pmcProfile.Health.Hydration.Current = pmcProfile.Health.Hydration.Maximum;
-            }
-        }
-
-        // Check all body parts
-        DecreaseBodyPartEffectTimes(pmcProfile, hpRegenPerHour, diffSeconds.Value);
-
-        // Update both values as they've both been updated
-        pmcProfile.Health.UpdateTime = currentTimeStamp;
+        healthHelper.UpdateProfileHealthValues(pmcProfile, DecreaseBodyPartEffectTimes);
     }
 
     /// <summary>
@@ -350,55 +322,10 @@ public class GameController(
     /// <param name="pmcProfile">Player</param>
     /// <param name="hpRegenPerHour"></param>
     /// <param name="diffSeconds"></param>
+    //Todo: Remove this at some point probably, it's just kept here to keep mods compatible
     protected void DecreaseBodyPartEffectTimes(PmcData pmcProfile, double hpRegenPerHour, double diffSeconds)
     {
-        var bodyParts = pmcProfile.Health!.BodyParts!.Select(bodyPartKvP => bodyPartKvP.Value).ToList();
-
-        // HP regeneration is an overall rate, so divide it across count of body parts
-        var hpRegenPerPart = hpRegenPerHour * (diffSeconds / 3600d) / bodyParts.Count;
-
-        foreach (var bodyPart in pmcProfile.Health!.BodyParts!.Select(bodyPartKvP => bodyPartKvP.Value))
-        {
-            // Check part hp
-            if (bodyPart.Health!.Current < bodyPart.Health.Maximum)
-            {
-                bodyPart.Health.Current += hpRegenPerPart;
-            }
-
-            if (bodyPart.Health.Current > bodyPart.Health.Maximum)
-            {
-                bodyPart.Health.Current = bodyPart.Health.Maximum;
-            }
-
-            if (bodyPart.Effects is null || bodyPart.Effects.Count == 0)
-            {
-                continue;
-            }
-
-            // Look for effects
-            foreach (var (effectId, effect) in bodyPart.Effects)
-            {
-                // remove effects below 1, .e.g. bleeds at -1
-                if (effect.Time < 1)
-                {
-                    // More than 30 minutes has passed
-                    if (diffSeconds > timeUtil.GetMinutesAsSeconds(30))
-                    {
-                        bodyPart.Effects.Remove(effectId);
-                    }
-
-                    continue;
-                }
-
-                // Decrement effect time value by difference between current time and time health was last updated
-                effect.Time -= diffSeconds;
-                if (effect.Time < 1)
-                // Effect time was sub 1, set floor it can be
-                {
-                    effect.Time = 1;
-                }
-            }
-        }
+        healthHelper.DecreaseBodyPartEffectTimes(pmcProfile, hpRegenPerHour, diffSeconds);
     }
 
     /// <summary>
